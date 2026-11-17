@@ -66,6 +66,15 @@ def nvidia_container_args(runtime: str) -> list[str]:
     return []
 
 
+def asr_model_for(gpu_args: list[str]) -> str:
+    """Speech-to-text model to pin in the container: VoiceStudio's own CPU pick
+    (Whisper small, 0.5 GB) without a GPU, large-v3-turbo with one."""
+    override = os.environ.get("AVTAAR_ASR_MODEL")
+    if override:
+        return override
+    return "deepdml/faster-whisper-large-v3-turbo-ct2" if gpu_args else "Systran/faster-whisper-small"
+
+
 def container_run_args(runtime: str, api_key: str, gpu_args: list[str]) -> list[str]:
     return [
         runtime, "run", "-d",
@@ -75,6 +84,10 @@ def container_run_args(runtime: str, api_key: str, gpu_args: list[str]) -> list[
         "-e", f"OMNIVOICE_API_KEY={api_key}",
         "-e", "OMNIVOICE_DATA_DIR=/app/omnivoice_data",
         "-e", "OMNIVOICE_ANALYTICS_DISABLED=1",
+        # VoiceStudio's default ASR is Whisper large-v3 (3 GB, slow on CPU); pin a fitting one.
+        # The engine must be pinned too: auto-detect picks WhisperX, which ignores ASR_MODEL_FASTER.
+        "-e", "OMNIVOICE_ASR_BACKEND=faster-whisper",
+        "-e", f"ASR_MODEL_FASTER={asr_model_for(gpu_args)}",
         "-v", f"{VOLUME}:/app/omnivoice_data",
         *gpu_args,
         IMAGE,
@@ -384,6 +397,88 @@ async def step_vs_config(ctx: StepContext) -> StepResult:
     return warn(msg + " " + "; ".join(notes).capitalize() + ".") if notes else ok(msg)
 
 
+def silent_wav(seconds: float = 1.0, rate: int = 16000) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"\x00\x00" * int(rate * seconds))
+    return buf.getvalue()
+
+
+async def probe_asr() -> tuple[int, dict]:
+    """Transcribe one second of silence. Returns (status, json). A 409 carries
+    VoiceStudio's `missing_repo_id` when no speech-to-text model is installed."""
+    prefs = effective_settings()
+    data = {"model": prefs["stt_model"]}
+    r = await voicestudio._client.post(
+        "/v1/audio/transcriptions",
+        data=data,
+        files={"file": ("probe.wav", silent_wav(), "audio/wav")},
+        timeout=httpx.Timeout(10.0, read=600.0),
+    )
+    try:
+        body = r.json()
+    except ValueError:
+        body = {}
+    return r.status_code, body if isinstance(body, dict) else {}
+
+
+def missing_asr_repo(body: dict) -> str | None:
+    """Find VoiceStudio's ASR_MODEL_MISSING payload wherever it nests it."""
+    stack = [body]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            repo = cur.get("missing_repo_id")
+            if isinstance(repo, str) and "/" in repo:
+                return repo
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return None
+
+
+async def step_asr_model(ctx: StepContext) -> StepResult:
+    ctx.progress("Checking for a speech-to-text model…")
+    try:
+        status, body = await with_heartbeat(ctx, probe_asr(), 10, "Loading the speech-to-text model", 900)
+    except Exception as e:  # noqa: BLE001
+        return fail(f"Could not reach VoiceStudio's speech-to-text: {e or type(e).__name__}")
+    if status == 200:
+        return ok("A speech-to-text model is installed and loads.")
+    repo = missing_asr_repo(body) if status == 409 else None
+    if not repo:
+        return fail(
+            f"Speech-to-text check failed (HTTP {status}): {json.dumps(body)[:200]}",
+            hint=f"Open VoiceStudio at {settings.voicestudio_url} → Model Catalogue and install a speech-to-text model.",
+        )
+
+    ctx.progress(f"Installing the speech-to-text model {repo}…")
+    r = await voicestudio._client.post("/models/install", json={"repo_id": repo}, timeout=httpx.Timeout(10.0, read=3600.0))
+    if r.status_code >= 400:
+        return fail(
+            f"VoiceStudio refused to install {repo} (HTTP {r.status_code}): {r.text[:200]}",
+            hint=f"Install it from VoiceStudio's Model Catalogue at {settings.voicestudio_url}.",
+        )
+    # The install may finish in the request or continue in the background: wait until ASR works.
+    deadline = time.monotonic() + 3600
+    start = time.monotonic()
+    while time.monotonic() < deadline:
+        try:
+            status, body = await probe_asr()
+        except httpx.HTTPError:
+            status, body = 0, {}
+        if status == 200:
+            return ok(f"Installed {repo} ({int(time.monotonic() - start)} s) and it transcribes.")
+        if status not in (0, 409, 503):
+            return fail(f"Speech-to-text still failing after installing {repo} (HTTP {status}).", hint=json.dumps(body)[:300])
+        ctx.progress(f"Downloading {repo}… ({int(time.monotonic() - start)} s)")
+        await asyncio.sleep(10)
+    return fail(f"{repo} did not finish installing within 60 min.", hint="Check VoiceStudio's Model Catalogue for progress.")
+
+
 async def step_tts_test(ctx: StepContext) -> StepResult:
     prefs = effective_settings()
     payload = {
@@ -520,9 +615,10 @@ def build_steps() -> list[Step]:
         Step("vs-install", "VoiceStudio installed", step_vs_install),
         Step("vs-ready", "VoiceStudio running", step_vs_ready, needs=["vs-install"]),
         Step("vs-config", "VoiceStudio connected", step_vs_config, needs=["vs-ready"]),
+        Step("asr-model", "Speech-to-text model installed", step_asr_model, needs=["vs-config"]),
         Step("tts-test", "Text-to-speech test", step_tts_test, needs=["vs-config"]),
-        Step("stt-test", "Speech-to-text test", step_stt_test, needs=["tts-test"]),
-        Step("live-stt-test", "Live transcription test", step_live_stt_test, needs=["tts-test"]),
+        Step("stt-test", "Speech-to-text test", step_stt_test, needs=["tts-test", "asr-model"]),
+        Step("live-stt-test", "Live transcription test", step_live_stt_test, needs=["tts-test", "asr-model"]),
     ]
 
 

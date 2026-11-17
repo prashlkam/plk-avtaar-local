@@ -98,11 +98,27 @@ async def speech(body: dict):
 TRANSCRIPT = "hello avatar what is the tallest mountain on mars"
 
 
+ASR = {"installed": os.environ.get("FAKE_NO_ASR") != "1"}
+
+
+@app.post("/models/install")
+async def install_model(body: dict):
+    LOG.append({"t": time.time(), "install": body.get("repo_id")})
+    if body.get("repo_id") != "Systran/faster-whisper-small":
+        return Response(json.dumps({"detail": f"Unknown model: {body.get('repo_id')!r}"}), 400, media_type="application/json")
+    ASR["installed"] = True
+    return {"status": "installed", "repo_id": body["repo_id"]}
+
+
 @app.post("/v1/audio/transcriptions")
 async def transcriptions(request: Request):
     form = await request.form()
     f = form.get("file")
     size = len(await f.read()) if f is not None else 0
+    if not ASR["installed"]:
+        detail = {"error": {"message": "No speech-to-text model is installed.", "code": "asr_model_missing",
+                            "missing_repo_id": "Systran/faster-whisper-small"}}
+        return Response(json.dumps(detail), 409, media_type="application/json")
     LOG.append({"t": time.time(), "stt_batch": True, "bytes": size, "model": form.get("model"), "language": form.get("language")})
     # Round-trip tests: "recognise" the last thing we were asked to say.
     if os.environ.get("FAKE_ECHO_STT", "1") == "1" and LAST_TTS["text"] and size > 40000:

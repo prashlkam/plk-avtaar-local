@@ -108,6 +108,8 @@ def test_container_command_is_local_only_and_keyed():
     args = steps.container_run_args("podman", "KEY123", [])
     joined = " ".join(args)
     assert "-p 127.0.0.1:3900:3900" in joined  # never exposed beyond this machine
+    assert "ASR_MODEL_FASTER=Systran/faster-whisper-small" in joined  # CPU-friendly ASR pinned
+    assert "OMNIVOICE_ASR_BACKEND=faster-whisper" in joined  # ...on the engine that reads that setting
     assert "OMNIVOICE_API_KEY=KEY123" in joined
     assert "OMNIVOICE_ANALYTICS_DISABLED=1" in joined
     assert f"{steps.VOLUME}:/app/omnivoice_data" in joined  # models survive re-runs
@@ -186,6 +188,7 @@ def test_full_setup_run_against_fake_voicestudio(setup_env):
         "vs-install": "ok",
         "vs-ready": "ok",
         "vs-config": "ok",
+        "asr-model": "ok",
         "tts-test": "ok",
         "stt-test": "ok",
         "live-stt-test": "ok",
@@ -196,7 +199,7 @@ def test_full_setup_run_against_fake_voicestudio(setup_env):
 
     # status + test audio are available afterwards
     st = client.get("/api/setup/status").json()
-    assert st["running"] is False and len(st["report"]["steps"]) == 11
+    assert st["running"] is False and len(st["report"]["steps"]) == 12
     audio = client.get("/api/setup/test-audio")
     assert audio.status_code == 200 and audio.content[:4] == b"RIFF"
 
@@ -213,5 +216,26 @@ def test_setup_pulls_missing_model_and_skips_dependents_on_failure(setup_env, mo
     assert pull.called
     assert final["ollama-model"]["status"] == "ok" and "Downloaded" in final["ollama-model"]["message"]
     assert final["vs-install"]["status"] == "fail" and "yay -S voicestudio-bin" in final["vs-install"]["hint"]
-    for dep in ("vs-ready", "vs-config", "tts-test", "stt-test", "live-stt-test"):
+    for dep in ("vs-ready", "vs-config", "asr-model", "tts-test", "stt-test", "live-stt-test"):
         assert final[dep]["status"] == "skip"
+
+
+def test_asr_model_missing_is_installed_by_setup(setup_env, monkeypatch):
+    import fake_voicestudio
+
+    monkeypatch.setitem(fake_voicestudio.ASR, "installed", False)
+    with respx.mock(assert_all_called=False) as m:
+        m.route(host="127.0.0.1", port=int(setup_env.rsplit(":", 1)[1])).pass_through()
+        mock_ollama(m)
+        r = client.post("/api/setup/run")
+    final = {d["id"]: d for e, d in parse_sse(r.text) if e == "step" and d["status"] != "running"}
+    assert final["asr-model"]["status"] == "ok", final["asr-model"]
+    assert "Installed Systran/faster-whisper-small" in final["asr-model"]["message"]
+    assert any(e.get("install") == "Systran/faster-whisper-small" for e in fake_voicestudio.LOG)
+    assert final["stt-test"]["status"] == "ok"
+
+
+def test_missing_asr_repo_parsing():
+    assert steps.missing_asr_repo({"detail": {"error": "asr_model_missing", "missing_repo_id": "A/b"}}) == "A/b"
+    assert steps.missing_asr_repo({"error": {"missing_repo_id": "unverified-local-model"}}) is None
+    assert steps.missing_asr_repo({}) is None

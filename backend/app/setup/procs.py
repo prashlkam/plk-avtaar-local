@@ -75,13 +75,21 @@ async def run_cmd(
         if buf.strip():
             lines.append(buf.decode(errors="replace").rstrip())
 
+    reader = asyncio.ensure_future(pump())
     try:
-        await asyncio.wait_for(asyncio.gather(pump(), proc.wait()), timeout)
+        await asyncio.wait_for(proc.wait(), timeout)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
+        reader.cancel()
         lines.append(f"(timed out after {int(timeout)} s)")
         return CmdResult(124, lines)
+    # The process has exited. Don't wait for EOF on the pipe forever: a child it left
+    # running (e.g. podman's conmon after `run -d`) can keep the pipe open indefinitely.
+    try:
+        await asyncio.wait_for(asyncio.shield(reader), 3)
+    except asyncio.TimeoutError:
+        reader.cancel()
     return CmdResult(proc.returncode or 0, lines)
 
 
